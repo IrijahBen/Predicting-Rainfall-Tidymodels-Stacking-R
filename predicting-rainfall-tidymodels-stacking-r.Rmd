@@ -1,0 +1,889 @@
+---
+title: "Predicting Rainfall | Tidymodels Stacking | R"
+date: "2025-Mar-08"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 6
+    code_folding: show
+    theme: cosmo
+    highlight: tango
+editor_options: 
+  markdown: 
+    wrap: 72
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      message = FALSE,
+                      fig.align = "center",
+                      fig.width = 7,
+                      fig.height = 5)
+
+```
+
+
+## About the Data set:
+
+**Dataset Description:**
+
+The dataset for this competition (both train and test) was generated from a deep learning model trained on the Rainfall Prediction using Machine Learning dataset. Feature distributions are close to, but not exactly the same, as the original. Feel free to use the original dataset as part of this competition, both to explore differences as well as to see whether incorporating the original in training improves model performance.
+
+**Files**
+train.csv - the training dataset; rainfall is the binary targett   
+test.csv - the test dataset; your objective is to predict the probability of rainfall for each row    
+sample_submission.csv - a sample submission file in the correct format.    
+
+
+**Goal:** to predict rainfall for each day of the year.    
+
+**Evaluation:** Submissions are evaluated on area under the ROC curve between the predicted probability and the observed target    
+
+
+
+## Import libraries
+
+```{r import-libraries}
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(scales)
+library(ggthemes)
+library(kableExtra)
+library(flextable)
+library(paletteer)
+library(patchwork)
+library(ggcorrplot)
+library(GGally)
+
+# Models
+
+library(tidymodels)
+library(stacks)
+library(bonsai)
+library(vip)
+
+SEED <- 6
+
+theme_set(theme_light())
+
+
+```
+
+
+## Import data
+
+```{r import-data}
+
+train_org <- read_csv("/kaggle/input/rainfall-prediction-using-machine-learning/Rainfall.csv") |> 
+  clean_names() |> 
+  mutate(rainfall = if_else(rainfall == "yes", 1, 0),
+         rainfall = fct_rev(as.factor(rainfall))) |> 
+  relocate(rainfall, .after = windspeed) |> 
+  rename("temperature" = temparature) |> 
+  drop_na()
+
+train_df <- read_csv("/kaggle/input/playground-series-s5e3/train.csv")  |> 
+  clean_names() |> 
+  mutate(rainfall = fct_rev(as.factor(rainfall))) |> 
+  rename("temperature" = temparature) |> 
+  select(-id) |> 
+  drop_na()
+
+train_df = bind_rows(train_df, train_org)
+
+test_df <- read_csv("/kaggle/input/playground-series-s5e3/test.csv") |> 
+  clean_names() |>
+  rename("temperature" = temparature) |> 
+  select(-id)
+
+sample_submission <- read_csv("/kaggle/input/playground-series-s5e3/sample_submission.csv")
+
+
+
+all_Variables <-train_df |>
+  colnames()
+
+num_Variables <- train_df |>
+  select(where(is.numeric)) |>
+  colnames()
+
+
+num_Variables_no_target <- train_df |>
+  select(where(is.numeric), -rainfall ) |>
+  colnames()
+
+```
+
+
+## EDA
+
+### Basic Summary statistics
+
+```{r}
+
+train_df |>
+  skim() |>
+  kbl(format = "html",
+      caption = "Variables Dignosis | Train",
+      digits = 2) |>
+  kable_classic(full_width = F)
+
+
+test_df |>
+    skim() |>
+  kbl(format = "html",
+      caption = "variables dignosis | Test",
+      digits = 2) |>
+  kable_classic(full_width = F)
+
+```
+
+**Observations:**     
+
+Observations:   
+
+Train_df:   
+• The dataset, without the Original dataset, contains 2190 entries with various attributes such as day, temperature, humidity, cloud, and rainfall.    
+• The “day” column has 365 unique values.   
+• The “rainfall” Binary 0 and 1.   
+
+Test_df:   
+• The dataset contains 730 entries with various attributes such as day, temperature, humidity, cloud, and rainfall.   
+• The “day” column has 365 unique values.    
+
+Features:
+• **day:** Day of the measurement.    
+• **pressure:** Atmospheric pressure.    
+• **maxtemp:** Maximum temperature.    
+• **temperature:** Average temperature.    
+• **mintemp:** Minimum temperature.    
+• **dewpointt:** Dew point temperature.    
+• **humidity:** Relative humidity.    
+• **cloud:** Cloud cover.    
+• **sunshine:** Sunshine duration.    
+• **winddirection:** Wind direction.    
+• **windspeed:** Wind speed.   
+• **rainfall:** YES = 1, NO = 0    
+
+
+
+1 missing value **winddirection:**   
+
+
+
+
+### Target variable Summary | convert to integer
+
+```{r}
+
+train_df |>
+  mutate(rainfall = rainfall) |> 
+  tabyl(rainfall) |>
+  arrange(-n) |>  
+  kbl(format = "html",
+      caption = "Target variable Counts",
+      digits = 4) |>
+  kable_classic(full_width = F)
+
+
+```
+
+
+### Target variable distribution 
+
+
+```{r, fig.width = 9, fig.height = 3}
+
+target_colors <- c(
+      "#db281c",
+    "#0580ca")
+
+train_df |>
+  select(rainfall) |>
+  count(rainfall) |> 
+  mutate(prop = prop.table(n),
+         prop = str_c(round(prop * 100 , 2), "%")) |> 
+  ggplot(aes(x = n , y = rainfall)) +
+  geom_col(aes(fill = rainfall),show.legend = FALSE) +
+  geom_text(aes(label = prop), hjust = 1.2)+
+  scale_fill_manual(values = target_colors) +
+  labs(title = "Target variable distribution | Rainfall",
+       caption = "Data source: Kaggle.com, Binary Prediction with a Rainfall Dataset",
+       x = "Counts",
+       y = "Rainfall")
+
+
+```
+
+
+### Distridution of Cloud Cover by Rainfall
+
+```{r, fig.width = 8, fig.height = 4}
+
+train_df %>% 
+  select(cloud, rainfall) %>%
+  ggplot(aes(cloud)) +
+  geom_histogram(
+    aes(cloud, color = rainfall, fill = rainfall),
+    alpha = 0.4,
+    position = "identity",
+    bins = 20,
+  ) +
+  geom_freqpoly(aes(linetype = rainfall), bins = 30) +
+  geom_rug(aes(color = rainfall)) +
+  scale_fill_manual(values = target_colors) +
+  scale_color_manual(values = target_colors) +
+  guides(color = "none") +
+  labs(title = "Distridution of Clouds by Rainfall",
+       caption = "Data source: Kaggle.com, Binary Prediction with a Rainfall Dataset",
+       x = "Cloud Cover",
+       y = NULL,
+       fill = NULL,
+       linetype = NULL,
+       fill = "Rainfall") 
+
+```
+
+
+
+
+
+### Numerical variables by Target variable | Train data
+
+```{r}
+
+train_df |>
+  select(all_of(num_Variables), rainfall) |>
+  pivot_longer(cols = -rainfall) |>
+  ggplot(aes(
+    x = value,
+    color = rainfall,
+    fill = rainfall
+  )) +
+  geom_density(linewidth = 0.7, alpha = 0.2) +
+  facet_wrap(vars(name), scales = "free") +
+  scale_color_tableau(palette = "Tableau 10") +
+  scale_fill_tableau(palette = "Tableau 10") +
+  guides(color = guide_legend(override.aes = list(size = 2), title = "Rainfall"),
+         fill = guide_legend(title = "Rainfall")) +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    strip.background = element_rect(fill = "white", color = "white"),
+    strip.text = element_text(colour = 'black', face = "bold")
+  ) +
+  labs(
+    title = "Numerical variables by Target variable",
+    caption = "Data source: Kaggle.com, Binary Prediction with a Rainfall Dataset",
+    x = "Value",
+    y = "Density"
+  )
+
+
+```
+
+
+### Atmospheric pressure VS Relative Humididty by Rainfall
+
+```{r, fig.width = 8, fig.height = 4}
+
+
+train_df %>% 
+  select(humidity, pressure, rainfall ) %>%
+  ggplot(aes(x = humidity, y = pressure)) +
+  geom_point(aes(color = rainfall),size = 2, show.legend = FALSE) +
+  geom_hline(aes(yintercept = mean(pressure)), color = "#9F28A9", size = 1) +
+  geom_vline(aes(xintercept = mean(humidity)), color = "#0E7BF1", size = 1) +
+  geom_smooth(color = "#CD5906", fill = "#BD853D") +
+  scale_color_manual(values = target_colors) +
+  annotate(
+    geom = "text",
+    x = 81,
+    y = 1030,
+    label = "Mean (Humidity)",
+    size = 3,
+    angle = 90,
+    color = "#0E7BF1"
+  ) +
+  annotate(
+    geom = "text",
+    x = 45,
+    y = 1015,
+    label = "Mean (Atmospheric pressure)",
+    size = 3,
+    color = "#9F28A9"
+  ) +
+theme(
+  plot.title.position = "plot",
+  plot.title = element_text(
+    hjust = 0,
+    face = "bold",
+    size = 13,
+    color = "#000000"
+  )
+) +
+  labs(
+    title = "Atmospheric pressure VS Relative Humididty by Rainfall",
+    subtitle = "Scatter Plot with mean Atmospheric pressure and mean Relative Humididty",
+    caption = "Data source: Kaggle.com, Binary Prediction with a Rainfall Dataset",
+    x = "Relative Humididty",
+    y = "Atmospheric pressure")
+  
+```
+
+
+
+
+### Correlation Matrix (Train and Test Dataset)
+
+```{r, fig.height= 12, fig.width=11}
+
+tr_col = "#a3c197"
+ts_col = "#db9e77"
+
+corrplot_train_df <-
+  train_df |>
+  select(- rainfall) |> 
+  cor() |> 
+  ggcorrplot(
+   outline.col = "white",
+   ggtheme = ggplot2::theme_minimal,
+   colors = c(tr_col, "white", ts_col),
+   tl.cex = 6,
+   lab = TRUE,
+   lab_size = 2,
+   lab_col = "#283655",
+   show.legend = FALSE) +
+  labs(title = "Correlation Matrix (Train Dataset)") +
+  theme(plot.background = element_rect(fill = "#f1fff1", color = "white"),
+        plot.title.position = "plot",
+        plot.title = element_text(hjust = 0.5, size = 10))
+  
+  
+  
+corrplot_test_df <-
+  test_df |>
+  cor() |> 
+  ggcorrplot(
+   outline.col = "white",
+   ggtheme = ggplot2::theme_minimal,
+   colors = c(tr_col, "white", ts_col),
+   tl.cex = 6,
+   lab = TRUE,
+   legend.title = "",
+   lab_size = 2,
+   lab_col = "#283655") +
+   labs(title = "Correlation Matrix (Test Dataset)") +
+  theme(plot.background = element_rect(fill = "#f1fff1", color = "white"),
+        plot.title.position = "plot",
+        plot.title = element_text(hjust = 0.5, size = 10),
+        legend.position = "left",
+        legend.key.height = unit("12", units = "mm"))
+
+
+corrplot_train_df + corrplot_test_df
+
+```
+
+
+### Pairs Plot
+
+```{r, fig.width=10, fig.height= 10, fig.align="center"}
+
+
+train_df |> 
+ggpairs(
+  aes(color = rainfall),
+  lower = list(continuous = wrap(
+    "smooth",
+    alpha = 0.2,
+    size = 0.5,
+    color = "#46d9a4"
+  )),
+  diag = list(continuous = "barDiag"),
+  upper = list(continuous = wrap("cor", size = 3))
+) +
+  scale_color_manual(values = target_colors) +
+  scale_fill_manual(values = target_colors) +
+  theme(
+    axis.text = element_text(size = 8),
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_rect(fill = "white"),
+    strip.background.x = element_rect(colour = "black"),
+    strip.background.y = element_rect(colour = "black"),
+    strip.text = element_text(color = "black", face = "bold", size = 8)
+  ) +
+  labs(
+    title = "Pair plot by rainfall Var",
+    subtitle = "Pair Plot, scatter plot, Histogram and Correlation coefficient",
+    caption = "Data source: Kaggle.com, Binary Prediction with a Rainfall Dataset",
+    x = NULL,
+    y = NULL
+  )
+
+
+```
+
+
+
+
+
+## Model
+
+### Pre-proccesing 
+
+
+```{r}
+
+test_df <- test_df |> 
+  mutate(winddirection = as.numeric(str_replace_na(winddirection, "70")))
+
+preproc_wset <- function(df) {
+  df <- df|> 
+    mutate(
+        cloud_sunshine =  cloud * sunshine,
+        htp = (humidity * temperature) / pressure,
+        winddirection_sin = sin(2 * pi * winddirection / 360),
+        winddirection_cos = cos(2 * pi * winddirection / 360),
+        day_sin = sin(2 * pi * day / 365),
+        day_cos = cos(2 * pi * day / 365),
+        humidity_pressure = humidity * pressure)
+      
+  
+  return(df)
+    
+}
+
+
+
+train_df_wset <- preproc_wset(train_df)
+
+test_df_wset <- preproc_wset(test_df)
+
+
+
+num_Variables_wset <- train_df_wset |>
+  select(where(is.numeric)) |>
+  colnames()
+
+
+glimpse(train_df_wset)
+
+sapply(test_df_wset, function(x) sum(is.na(x)))
+
+levels(train_df_wset$rainfall)
+
+
+```
+
+
+### Data Splitting
+
+Split the data into train/test splits.
+
+```{r}
+
+set.seed(SEED)
+init_split <- initial_split(train_df_wset, prop = 0.8, strat = "rainfall")
+
+train_data <- training(init_split)
+test_data <- testing(init_split)
+
+train_data |>
+  head()
+
+test_data |>
+  head()
+```
+
+### Generate CV samples 5 folds
+
+```{r}
+
+set.seed(SEED)
+cv_folds <- vfold_cv(
+  data = train_data, 
+  v = 5
+  ) 
+
+cv_folds
+```
+
+
+### Prepare the data with a recipe
+
+
+```{r}
+
+basic_rec <- recipe(
+    rainfall ~ .,
+    data = train_data) |>
+  step_normalize(all_numeric_predictors())
+
+basic_rec
+
+```
+
+
+### Specifying the models
+
+We will fit three models at once:
+
+1. Random Forest
+2. Ranger
+3. XGBoost
+4. Lightgbm
+5. K-Nearest Neighbor
+6. glmnet
+7. SVM
+
+```{r}
+
+## Random forest
+rf_model <- rand_forest(
+    mtry = tune(),
+    trees = tune(),
+    ) |>
+  set_mode("classification") |>
+  set_engine("randomForest")
+
+## Ranger
+ranger_model <- rand_forest(
+    mtry = tune(),
+    trees = tune(),
+    ) |>
+  set_mode("classification") |>
+  set_engine("ranger")
+
+## XGBoost
+xgb_model <- boost_tree(
+  trees = 500,
+  mtry = tune(),
+  tree_depth = tune(),
+  learn_rate = tune()
+  ) |>
+  set_mode("classification") |> 
+  set_engine("xgboost")
+
+
+## Lightgbm
+lgbm_model <- boost_tree(
+  trees = 500,
+  mtry = tune(),
+  tree_depth = tune(),
+  learn_rate = tune()
+  ) |>
+  set_mode("classification") |> 
+  set_engine("lightgbm")
+
+
+## Glmnet
+glmnet_model <-
+  logistic_reg(penalty = tune()) |>
+  set_engine('glmnet')  |>
+  set_mode('classification')
+
+## SVM
+svm_model <-
+  svm_rbf(cost = tune(), 
+          rbf_sigma = tune()) %>%
+  set_engine('kernlab') %>%
+  set_mode('classification')
+
+
+## Kknn
+knn_model <-
+  nearest_neighbor(neighbors = 3) |>
+  set_mode("classification") |>
+  set_engine("kknn")
+
+
+```
+
+
+### Workflow Set
+
+
+```{r}
+
+
+
+wf_set <- workflow_set(
+  preproc = list("Basic_rec" = basic_rec),
+  models = list("RandomForest" = rf_model, 
+                "Xgboost" = xgb_model, 
+                "Lightgbm" = lgbm_model, 
+                "Ranger" = ranger_model,
+                "Glmnet" = glmnet_model,
+                "SVM" = svm_model,
+                "Knn" = knn_model),
+  cross = TRUE
+)
+
+
+wf_set <-
+  wf_set  |> 
+  option_add(
+    control = control_stack_grid(),
+    metrics = metric_set(roc_auc)
+  )
+
+wf_set
+```
+
+
+### Tune & fit the 6 workflows
+
+
+```{r}
+
+wf_tuned <- wf_set |>  
+  workflow_map(
+    seed = SEED, 
+    fn = "tune_grid",
+    grid = 30,
+    resamples = cv_folds
+  )
+
+wf_tuned
+
+
+```
+
+
+### Evaluate each model's performance on the train_data set
+
+
+```{r, fig.width = 8, fig.height = 4}
+
+autoplot(wf_tuned)
+
+collect_metrics(wf_tuned) 
+
+rank_results(wf_tuned, rank_metric = "roc_auc", select_best = TRUE)
+
+```
+
+
+
+### Extract the model with the best performance
+
+```{r}
+
+
+best_model_id <- wf_tuned |> 
+  rank_results(
+    rank_metric = "roc_auc",
+    select_best = TRUE
+  ) |> 
+  head(1) |> 
+  pull(wflow_id)
+
+best_model_id
+
+best_model <- extract_workflow(wf_tuned, id = best_model_id)
+best_model
+
+```
+
+
+### Extract the tuned results from workflow of the best model
+
+
+```{r}
+       
+best_workflow <- 
+  wf_tuned |> 
+  extract_workflow_set_result("recipe_rand_forest", id = best_model_id)
+
+best_workflow
+
+```
+
+### Select Best Parameter
+
+```{r}
+
+collect_metrics(best_workflow)
+select_best(best_workflow, metric =   "roc_auc")
+
+```
+
+
+### Fit the final model
+
+```{r}
+
+final_wf <- finalize_workflow(best_model, select_best(best_workflow,  metric =   "roc_auc"))
+
+final_fit <- final_wf |> 
+  last_fit(
+    split = init_split
+  )
+
+final_fit
+
+
+```
+
+
+### Extract Variable Importance
+
+
+```{r}
+
+if (best_model$fit$actions$model$spec$engine == "kernlab"){
+  
+  print("Error: Model-specific variable importance scores are currently not available for this type of model.")
+} else {
+    final_fit |>
+    extract_fit_parsnip() |>
+    vip(geom = "col",
+        aesthetics = list(
+                color = "black",
+                fill = "darkgreen",
+                alpha = 0.5,
+                width = 0.8)) +
+    theme_classic()+
+    labs(title = "Variable Importance | Final fit",
+         x = "Importance",
+         y = NULL)
+  
+}
+
+```
+
+
+
+### ROC Curve
+
+```{r}
+
+set_best <- select_best(best_workflow, metric = "roc_auc")
+
+set_best_auc <- 
+  best_workflow %>% 
+  collect_predictions(parameters = set_best) %>% 
+  roc_curve(rainfall, .pred_1) 
+
+autoplot(set_best_auc)
+
+```
+
+
+### Confusion Matrix
+
+```{r}
+
+collect_predictions(final_fit) %>%
+  conf_mat(rainfall, .pred_class) %>%
+  pluck(1) %>%
+  as_tibble() %>%
+  ggplot(aes(Truth, Prediction, alpha = n)) +
+  geom_tile(show.legend = FALSE, fill = "steelblue") +
+  geom_text(
+    aes(label = n),
+    colour = "#2F423D",
+    alpha = 1,
+    size = 7
+  ) 
+
+```
+
+
+### Predictions Distribution
+
+```{r}
+
+
+final_fit |> 
+  collect_predictions() |> 
+  ggplot(aes(x = .pred_1, fill = rainfall )) +
+  geom_histogram(alpha = 0.6)+
+  scale_fill_manual(values = target_colors)  +
+  labs(title = "Predictions Distribution | Final fit",
+       x = "Rainfall",
+       y = "Counts")
+
+```
+
+
+### Stacking
+
+```{r}
+
+model_stacking <- 
+  stacks()  |> 
+  add_candidates(wf_tuned)  |> 
+  blend_predictions(
+      penalty = c(10^seq(-3,-1,.05)),
+      metric = metric_set(roc_auc),
+      control = tune::control_grid(allow_par = TRUE))  |> 
+  fit_members()
+
+autoplot(model_stacking) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "white"),
+    strip.background.x = element_rect(colour = "white"),
+    strip.background.y = element_rect(colour = "white"),
+    strip.text = element_text(
+      color = "black",
+      face = "bold",
+      size = 7
+    )
+  ) +
+  labs(title = "Autoplot - Ensemble",
+    y = "Roc_auc")
+```
+
+## Submission
+       
+```{r}
+
+pred <- predict(model_stacking, new_data = test_df_wset, type= "prob")
+
+submit <- sample_submission |> 
+  mutate(rainfall = pred$.pred_1) 
+
+submit  |> 
+  write_csv("submission.csv")
+
+submit
+```
+
+### predictions to submit
+
+```{r}
+
+submit |>
+  ggplot(aes(x = rainfall)) +
+  geom_histogram(bins = 40,
+                 color = "white",
+                 fill = "gray") +
+  labs(title = "Predictions distribution | Submission",
+       x = "Rainfall",
+       y = "Counts")
+
+```
+       
+
+## NEXT
+
+I will consider potential improvements, such as:     
+
+• More Data understanding.     
+• More data transformation strategy.     
+• Models Enhancement.     
+• Performing feature selection or engineering to enhance the model’s performance.    
+• More...    
+
+For Python Varsion please check the link below:
+       
+https://www.kaggle.com/code/khsamaha/rainfall-prediction-randomeforest-voting-py
+
+Stay Tuned! Your support is highly appreciated!    
+
